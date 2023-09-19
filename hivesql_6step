@@ -1,0 +1,235 @@
+-- 第一步
+drop table if exists move_after_nly;
+create  table move_after_nly
+as select
+      uid, date, stime, etime, poi_o, poi_d,
+      case
+          when lag(poi_d,1) over(partition by date,uid order by stime) is null
+           or poi_o != lag(poi_d,1) over (partition by date,uid order by stime) then 0
+           else 1
+       end as bfr,
+       case
+           when lead(poi_o,1) over(partition by date,uid order by stime) is null
+               or poi_d!=lead(poi_o,1)over(partition by date,uid order by stime) then 0
+            else 1
+        end as nxt
+from move_month_test_nly;
+-- 第二步
+drop table if  exists  ans_nly;
+create  table ans_nly
+as select
+       uid, stime, etime, poi_id, ptype, date
+from stay_month_test_nly;
+-- 设定时间阈值为5分钟，当本条驻留和下一条驻留位置相同时，且小于时间阈值时，标记cnt为1，其余为0
+24.drop table if exists  ans2_nly;
+25.create table ans2_nly
+26.as select
+27.       uid, stime, etime, poi_id, ptype, date,
+28.       case
+29.           when lead(poi_id,1) over(partition by uid,date order by stime) = poi_id
+30.            and (UNIX_TIMESTAMP(lead(stime, 1) over(partition by uid,date order by stime),'yyyy-MM-dd HH:mm:ss') - UNIX_TIMESTAMP(etime,'yyyy-MM-dd HH:mm:ss') )<= 300 then 1
+31.       else 0
+32.       end as cnt
+33.from ans_nly;
+34.
+35.-- select stime,cnt from ans2_nly;
+36.-- drop table ans_nly;
+37.-- 定义drop_index字段，检索出本行的cnt为1且前一行的cnt也为1的记录
+38.-- 则把本行标记成drop_index=1，其余drop_index为0，drop_index=1的记录就是之后要删去的
+39.drop table if exists ans3_nly;
+40.create table ans3_nly
+41.as select
+42.       uid, stime, etime, poi_id, ptype, date,cnt,
+43.       case
+44.           when lag(cnt,1) over(partition by uid, date order by stime) =1
+45.            and cnt =1 then 1
+46.       else 0
+47.       end as drop_index
+48.from ans2_nly
+49.order by uid, date,stime;-- 这个排序一定需要吗？
+50.
+51.drop table ans2_nly;
+52.-- 标记出要删去的行的前一行和后一行
+53.-- 如果该行不删，且前一行要删，则该行就是后一行，cnt=0，标记drop_index=-1
+54.-- 如果该行不删，且后一行要删，则该行就是前一行，cnt=1，标记drop_index=2
+55.drop table if exists ans4_nly;
+56.create  table ans4_nly
+57.as select
+58.       uid,stime,etime,poi_id,ptype,date,cnt,
+59.       case
+60.           when lead(drop_index,1) over (partition by uid,date order by stime) =1 and drop_index=0 then 2
+61.           when lag(drop_index,1) over (partition by uid,date order by stime) =1 and drop_index=0 then -1
+62.       else drop_index
+63.       end as drop_index
+64.from ans3_nly
+65.where drop_index != 1;-- drop_index=1的都删了，所以只留了不=1的
+66.drop table if exists ans5_nly;
+67.create table ans5_nly
+68.as select 
+69.uid,stime,etime,poi_id,ptype,date,cnt,drop_index
+70.from ans4_nly
+71.where drop_index!=1;
+72.
+73.drop table ans3_nly;
+74.
+75.drop table if exists ans6_nly;
+76.create table ans6_nly
+77.as select
+78.       uid, stime, poi_id, ptype, date,  cnt, drop_index,
+79.       case
+80.           when drop_index=2 then lead(etime,1) over (partition by uid,date order by stime) 
+81.           else etime
+82.       end as etime
+83.from ans5_nly
+84.where drop_index != -1; -- drop_index=-1的都删了
+85.drop table if exists stay_month_2step_nly;
+86.create table stay_month_2step_nly
+87.as select 
+88.uid, stime, poi_id, ptype, date,  cnt, drop_index,etime
+89.from ans6_nly
+90.where drop_index!=-1;
+91.
+92.
+93.            
+94.
+95.drop table ans4_nly;
+96.
+97.-- 第三步
+98.drop table if exists stay_month_type1_nly;
+99.create table stay_month_type1_nly
+100.as select
+101.       uid, date,
+102.       case
+103.            when nxt==1 then poi_d
+104.       end as poi_stay, -- 当nxt等于1的时候，驻留点位置是nxt=1的move的终点
+105.       case
+106.            when nxt==1 then etime
+107.       end as stime_stay, -- 当nxt等于1的时候，驻留开始时间是nxt=1的move的结束时间
+108.       case
+109.            when nxt==1 then lead(stime,1) over(partition by uid,date order by stime)
+110.       end as etime_stay -- 当nxt等于1，驻留的结束时间是nxt等于1的下一行的开始时间
+111.from move_after_nly
+112.where poi_stay is not null -- 筛选出来有这一类驻留的记录
+113.order by uid,date;
+114.-- 只要nxt=1，则会产生一个poi_stay,一个stime_tay和一个etime_stay,他们应该是一一对应的，那么对于其他的uid和date，这三个字段应该是空的
+115.
+116.
+117.select date, poi_stay,stime_stay,etime_stay from stay_type1_nly;
+118.-- 第三步存在问题，有可能是因为测试数据只有1000条，cnt全都为0，因此为空；需要完整数据测试一下
+119.-- 第四步
+120.drop table if exists stay_month_fake_move_nly; -- 伪移动表，把驻留伪装成移动的样子
+121.create table stay_month_fake_move_nly
+122.as select
+123.       uid, stime, etime, poi_id, ptype, date,
+124.       poi_id as poi_o_stay, poi_id as poi_d_stay,
+125.       0 as type, -1 as bfr, -1 as nxt -- type用来标记move还是stay，type为0就是stay，type=1就是move
+126.      -- 因为要和move表链接，所以也要构造bfr和nxt字段，所以把move的bfr和nxt都标记为-1
+127.from stay_month_2step_nly;
+128.
+129.
+130.drop table if exists move_month_1step_nly; -- 调整第一步生成的move表，添加type字段，type=1都是move
+131.create table move_month_1step_nly
+132.as select
+133.       uid, date, stime, etime, poi_o, poi_d,bfr,nxt,
+134.       1 as type
+135.from move_after_nly;
+136.
+137.
+138.drop table if exists ans_nly;  -- 纵向连接move和stay表，链接完之后把他们按照用户和日期分组，然后按照时间排序
+139.create table ans_nly
+140.as select
+141.       uid,date,stime,etime,poi_o,poi_d,type,bfr,nxt
+142.from move_month_1step_2_nly
+143.union all
+144.    select
+145.        uid,date,stime,etime,poi_o_stay as poi_o,poi_d_stay as poi_d,type,
+146.        bfr,nxt
+147.from stay_month_fake_move_nly; 
+148.
+149.drop table if exists move_stay_chain_nly;
+150.create  table move_stay_chain_nly
+151.as select
+152.       uid,date,stime,etime,poi_o,poi_d,bfr,nxt,type
+153.from ans_nly
+154.order by uid,date,stime;-- 这里没办法用group by，直接order by是不是也可以实现按照用户、日期分组之后时间排序
+155.                        -- 需要开窗函数吗？
+156.
+157.
+158.drop table if exists ans2_nly;
+159.create table ans2_nly
+160.as select
+161.       uid,date,stime,etime,poi_o,poi_d,nxt,bfr,
+162.       case
+163.            when bfr=0 and type=1 and lag(type,0) over(partition by uid,date order by stime) ==0 -- bfr等于0且本行是move且前一行代表驻留点
+164.            and lag(poi_d,1) over(partition by uid,date order by stime) = poi_o then 1 
+165.            when nxt=0 and type=1 and lead(type,0) over(partition by uid,date order by stime) = 0
+166.            and lead(poi_o,1) over(partition by uid,date order by stime)=poi_d then 2
+167.       else 0
+168.       end as stay_choice -- 用stay_choice表示要选择哪一条，stay_choice=1，表示要选择他的前一行驻留，为2表示要选择他的后一行驻留
+169.from move_stay_chain_nly;
+170.
+171.drop table if exists move_month_natural_gap_nly; -- 可以根据stay_choice提取出所有自然间断的move，但好像用不到，先提出来再说吧
+172.create table move_month_natural_gap_nly
+173.as select
+174.       uid,date,stime,etime,poi_o,poi_d,nxt,bfr,stay_choice
+175.from ans2_nly
+176.where stay_choice=1 or stay_choice=2;
+177.-- stay_choice=1，表示要选择他的前一行驻留，为2表示要选择他的后一行驻留
+178.
+179.drop table if exists stay_month_type2_nly; -- 得到第二种类型的stay
+180.create table stay_month_type2_nly
+181.as select
+182.  uid,date,stime,etime,poi_o,poi_d,nxt,bfr,
+183.  case 
+184.    when lead(stay_choice,1) over(partition by uid,date order by stime) = 1 or lag(stay_choice,1) over(partition by uid,date order by stime) = 2 
+185.    then 1
+186.    else 0
+187.  end as ifstay -- 通过stay_choice的值判断出自然间断move中间需要保留的stay，保存为ifstay字段，ifstay=1，则该stay保留，ifstay=0，则该stay删除
+188.from ans2_nly;
+189.
+190.-- 第五步
+191.-- 这一步不对，应该对uid和date分组操作
+192.drop table if exists stay_month_type3_nly; -- 得到第三种类型的stay
+193.create table stay_month_type3_nly
+194.as select
+195.       uid, stime, etime, poi_id, ptype, a.datezuikuai
+196.from stay_month_test_nly a
+197.where a.date not in (select b.date from move_after_nly b join a on a.date=b.date and a.uid=b.uid);
+198.-- 这一步的逻辑是，连接move和stay表，只保留对于每个用户在stay和move里都出现的日期，那么对于全部的stay，没有在这些日期里就说明没有在move里出现
+199.-- 其实也可以用left join或者right join，那样的话可能简单一点
+200.
+201.-- 第六步
+202.drop table if exists stay_month_after_nly;
+203.create table stay_month_after_nly
+204.as select 
+205.       uid,date,stime,etime,poi_o,poi_d, 1 as type
+206.from stay_month_type2_nly
+207.union all
+208.       select 
+209.       uid,date,stime_stay as stime,etime_stay as etime, poi_stay as poi_o, poi_stay as poi_d, 1 as type
+210.from stay_month_type1_nly
+211.union all
+212.   select
+213.       uid, date, stime, etime, poi_id as poi_o, poi_id as poi_d, 1 as type
+214.from stay_month_type3_nly
+215.order by uid,date,stime;
+216.
+217.-- 最后：把全部的stay和全部的move连接起来，形成完整的出行链
+218.drop table if exists stay_move_chain_all_nly;
+219.create stay_move_chain_all_nly
+220.as select
+221.  uid,date,stime,etime,poi_o,poi_d, type
+222.from stay_month_after_nly
+223.union all
+224.  select 
+225.  uid,date,stime,etime,poi_o,poi_d, 0 as type
+226.from move_after_nly
+227.order by uid,date,stime;
+228.
+229.-- 不知道需不需要分组呀
+230.drop table if exists group_stay_move_chain_nly;
+231.create table group_stay_move_chain_nly
+232.as select
+233.  uid,date,stime,etime,poi_o,poi_d,type,
+234.  row_number() over(partition by uid,date order by stime) as row_number
+235.from stay_move_chain_all_nly;
